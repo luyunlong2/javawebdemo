@@ -1,0 +1,24 @@
+--JNDI配置及连接池的使用
+<Resource name="aaa" auth="Container" type="javax.sql.DataSource"
+maxActive="50" maxIdle="30" maxWait="5000" username="lyl" password="123456"
+driverClassName="oracle.jdbc.driver.OracleDriver" 	url="jdbc:oracle:thin:@localhost:1521:orcl" /> 
+    
+Context initCtx = new InitialContext();
+DataSource ds = (DataSource)envCtx.lookup("Java:comp/env/aaa");
+conn = ds.getConnection();
+--JDBC的使用
+Connection conn=null;
+try ...{
+Class.forName("oracle.jdbc.Driver.DriverManager");
+conn=DriverManager.getConnection("jdbc:oracle:thin:@localhost:1521:orcl");
+......
+conn.close();
+} catch(Exception e) ...{
+e.printStackTrace();
+} finally ...{
+if(conn!=null) ...{
+try ...{
+    conn.close();
+} catch(SQLException e) ...{}
+}
+} 
