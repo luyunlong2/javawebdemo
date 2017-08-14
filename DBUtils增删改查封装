@@ -1,0 +1,433 @@
+import java.lang.annotation.Annotation;
+import java.lang.reflect.AnnotatedElement;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.security.interfaces.RSAKey;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+
+import javax.naming.Context;
+import javax.naming.InitialContext;
+import javax.naming.NamingException;
+import javax.sql.DataSource;
+import javax.xml.ws.soap.MTOM;
+
+import org.jxnd.annotation.TableAnnotation;
+import org.jxnd.bean.Roles;
+import org.jxnd.bean.Users;
+
+/**
+ * @author 今晚打老虎
+ * @see	一个关于数据库访问的简单封装<br>
+ * @see <b>当前版本需要数据库的表名和列名与实体类的类名和字段名保持一直,否则数据无法转载<b>
+ * */
+@SuppressWarnings("all")
+public class DBTools {
+	private static Connection conn;					//当前连接对象
+	private static final String name="C##admin";	//用户名
+	private static final String pwd="123456";		//密码
+	private static final String envName="aaa";		//JNDI名,tomcat配置的连接池名称
+	
+	private static final boolean isPool=false;		//是否使用连接池(如果需要使用连接池,请在web环境测试)
+	private static Context ctx=null;				//创建容器对象
+	private static DataSource ds=null;				//容器中取出Datasource数据源
+
+	
+	//初始化资源
+	static{
+		try {
+			if (isPool) {
+				ctx = new InitialContext();
+				ds=(DataSource)ctx.lookup("java:comp/env/"+envName);
+			}else
+				Class.forName("oracle.jdbc.driver.OracleDriver");
+			
+		} catch (ClassNotFoundException e) {
+			e.printStackTrace();
+		} catch (NamingException e) {
+			e.printStackTrace();
+		}
+	}
+	
+	//获取连接方法(如果被多线程并发访问,此处的连接会不安全,请使用ThreadLocal对象)
+	private static Connection getConnection(){
+		try {
+			if (isPool) 
+				conn=ds.getConnection();
+			else
+				conn=DriverManager.getConnection("jdbc:oracle:thin:@localhost:1521:orcl",name,pwd);
+		} catch (SQLException e) {
+			e.printStackTrace();
+		}
+		return conn;
+	}
+
+	/**插入对象*/
+	public static <T> int insertOjbect(T t){
+		int i=0;
+		try {
+			//列名集合
+			List<String> columns=new ArrayList<String>();
+			//列的值集合
+			List<Object> values=new ArrayList<Object>();
+			Class c=t.getClass();
+			//获取所有列名
+			for (Field me: c.getDeclaredFields()) {
+				TableAnnotation an=me.getAnnotation(TableAnnotation.class);
+				columns.add(me.getName());
+				if (an!=null&&!an.isCreate())	
+					columns.remove(me.getName());
+			}
+			//生成插入的SQL
+			String sql=createInsertSql(c,columns);
+			//绑定列名的值
+			for (String string : columns) {
+				for (Method mt : c.getMethods()) {
+					if (mt.getName().equalsIgnoreCase("get"+string)) {
+						values.add(mt.invoke(t, null));
+					}
+				}
+			}
+			//执行
+			i=executeUpdate(sql, values);
+		} catch (Exception e) {
+			e.printStackTrace();
+		}finally{
+			close();
+		}
+		return i;
+	}
+	
+	/**通过主键ID获取对象*/
+	public static <T> T getObject(Class<T> c,int id){
+		T t=null;
+		ResultSet rs=null;
+		try {
+			//如果反射创建对象
+			t = c.newInstance();
+			//列名集合
+			List<String> columns=new ArrayList<String>();
+			//获取所有列名集合
+			for (Field fi : c.getDeclaredFields()) {
+				columns.add(fi.getName());
+			}
+			//开始拼接查询的SQL语句
+			String sql=getSelectSql(columns,c.getSimpleName());
+			//获取结果集
+			rs=getReusultSet(sql,id);
+			if (rs.next()) {
+				//遍历所有需要赋值的列
+				t= SetInfo(c, columns, rs);
+			}
+		} catch (InstantiationException e) {
+			e.printStackTrace();
+		} catch (IllegalAccessException e) {
+			e.printStackTrace();
+		} catch (SQLException e) {
+			e.printStackTrace();
+		} catch (IllegalArgumentException e) {
+			e.printStackTrace();
+		} catch (Exception e) {
+			e.printStackTrace();
+		}finally{
+			close();
+		}
+		return t;
+	}
+
+	/**通过SQL语句和参数,查询整个集合*/
+	public static <T> List<T> getListBySql(Class<T> c,String sql,List<Object> plist){
+		List<T> list=new ArrayList<T>();
+		ResultSet rs=null;
+		try {
+			//列名集合
+			List<String> columns=new ArrayList<String>();
+			//赋值列名集合
+			for (Field fi : c.getDeclaredFields()) {
+				columns.add(fi.getName());
+			}
+			rs=getReusultSet(sql, plist);
+			while (rs.next()) {
+				list.add(SetInfo(c, columns, rs));
+			}
+		} catch (SQLException e) {
+			e.printStackTrace();
+		}finally{
+			//此处的结果集对象也应该放在close关闭
+			try {
+				rs.close();
+			} catch (SQLException e) {
+				e.printStackTrace();
+			}
+			close();
+		}
+		return list;
+	}
+	
+	/**
+	 * 删除对象
+	 * */
+	public static int deleteObject(Class c,int id){
+		int i=0;
+		StringBuffer sb=new StringBuffer();
+		sb.append("delete from ");
+		sb.append(c.getSimpleName());
+		sb.append(" where id=?");
+		i=executeUpdate(sb.toString(), id);
+		return i;
+	}
+
+	/**修改对象*/
+	public static <T> int updateObject(T t){
+		int i=0;
+		Class c=t.getClass();
+		List<String> columns=new ArrayList<String>();
+		List<Object> values=new ArrayList<Object>();
+		StringBuffer sb=new StringBuffer();
+		for(Field fl: c.getDeclaredFields()){
+			columns.add(fl.getName());
+		}
+		sb.append("update ");
+		sb.append(c.getSimpleName());
+		sb.append(" set ");
+		for (String string : columns) {
+			sb.append(string);
+			sb.append("=?,");
+		}
+		sb.delete(sb.length()-1, sb.length());
+		sb.append("where id=?");
+		for (String s:columns) {
+			for (Method mt: c.getMethods()) {
+				if (mt.getName().equalsIgnoreCase("get"+s)) {
+					try {
+						System.out.println(mt.getName());
+						values.add(mt.invoke(t, null));
+					} catch (IllegalAccessException e) {
+						e.printStackTrace();
+					} catch (IllegalArgumentException e) {
+						e.printStackTrace();
+					} catch (InvocationTargetException e) {
+						e.printStackTrace();
+					}
+				}
+			}
+		}
+		try {
+			//最后添加ID
+			values.add(c.getMethod("getId", null).invoke(t, null));
+		} catch (IllegalAccessException e) {
+			e.printStackTrace();
+		} catch (IllegalArgumentException e) {
+		} catch (InvocationTargetException e) {
+			e.printStackTrace();
+		} catch (NoSuchMethodException e) {
+			e.printStackTrace();
+		} catch (SecurityException e) {
+			e.printStackTrace();
+		}
+		i=executeUpdate(sb.toString(), values);
+		return i;
+	}
+	
+	/**结果集赋值给实体类*/
+	public static <T> T SetInfo(Class<T> c,List<String> columns,ResultSet rs){
+		T t=null;
+		try {
+			t = c.newInstance();
+			for (String string : columns) {
+				//反射查找set方法和列名匹配的
+				for (Method th: c.getMethods()) {
+					if (th.getName().equalsIgnoreCase("set"+string)) {
+						Object value=null;
+						String typeName=th.getParameterTypes()[0].getSimpleName();
+						//判断数据类型
+						switch (typeName) {
+						case "int":
+						case "Integer":
+							value=rs.getInt(string);
+							break;
+						case "String":
+							value=rs.getString(string);
+							break;
+							//此处还有六个
+						}
+						th.invoke(t, value);
+					}
+				}
+			}
+		} catch (InstantiationException e) {
+			e.printStackTrace();
+		} catch (IllegalAccessException e) {
+			e.printStackTrace();
+		} catch (IllegalArgumentException e) {
+			e.printStackTrace();
+		} catch (InvocationTargetException e) {
+			e.printStackTrace();
+		} catch (SQLException e) {
+			e.printStackTrace();
+		}
+		return t;
+	}
+	
+	/**根据SQL语句和参数获取Result对象*/
+	private static ResultSet getReusultSet(String sql,List<Object> list){
+		ResultSet rs=null;
+		try {
+			PreparedStatement ppst=getConnection().prepareStatement(sql);
+			for (int i = 0; list!=null&&i <list.size(); i++) {
+				ppst.setObject(i+1, list.get(i));
+			}
+			return ppst.executeQuery();
+		} catch (Exception e) {
+			e.printStackTrace();
+		}
+		return rs;
+	}
+	
+	/**根据SQL语句和主键ID,获取对象*/
+	private static ResultSet getReusultSet(String sql,int i){
+		ResultSet rs=null;
+		try {
+			PreparedStatement ppst=getConnection().prepareStatement(sql);
+			ppst.setInt(1, i);
+			return ppst.executeQuery();
+		} catch (Exception e) {
+			e.printStackTrace();
+		}
+		return rs;
+	}
+
+	/**根据SQL语句获取对象*/
+	private static ResultSet getReusultSet(String sql){
+		ResultSet rs=null;
+		try {
+			PreparedStatement ppst=getConnection().prepareStatement(sql);
+			return ppst.executeQuery();
+		} catch (Exception e) {
+			e.printStackTrace();
+		}
+		return rs;
+	}
+	
+	/**根据SQL语句和多个参数来执行操作*/
+	private static int executeUpdate(String sql,List<Object> list){
+		try {
+			PreparedStatement ppst=getConnection().prepareStatement(sql);
+			for (int i = 0; i < list.size(); i++) {
+				ppst.setObject(i+1, list.get(i));
+			}
+			return ppst.executeUpdate();
+		} catch (SQLException e) {
+			e.printStackTrace();
+		}finally{
+			close();
+		}
+		return 0;
+	}
+	
+	/**根据SQL语句和一个参数(这个参数尽量是主键)来执行操作*/
+	private static int executeUpdate(String sql,int id){
+		try {
+			PreparedStatement ppst=getConnection().prepareStatement(sql);
+			ppst.setInt(1, id);
+			return ppst.executeUpdate();
+			
+		} catch (SQLException e) {
+			e.printStackTrace();
+		}finally{
+			close();
+		}
+		return 0;
+	}
+
+	/**根据SQL语句来执行操作*/
+	private static int executeUpdate(String sql){
+		try {
+			PreparedStatement ppst=getConnection().prepareStatement(sql);
+			return ppst.executeUpdate();
+		} catch (SQLException e) {
+			e.printStackTrace();
+		}finally{
+			close();
+		}
+		return 0;
+	}
+	
+	/**插入的SQL语句生成器*/
+	private static <T> String createInsertSql(Class<T> c,List<String> columns){
+		StringBuffer bf=new StringBuffer();
+		bf.append("insert into ");
+		TableAnnotation ta=c.getAnnotation(TableAnnotation.class);
+		if (ta==null) 
+			bf.append(c.getSimpleName());
+		else 
+			bf.append(ta.name());
+		bf.append(" (");
+		for (String string : columns) {
+			bf.append(string);
+			bf.append(",");
+		}
+		bf.delete(bf.length()-1, bf.length());
+		bf.append(") ");
+			//insert into users id,name,pwd,roleid values
+		bf.append("values(");
+		for (String string : columns) {
+			bf.append("?,");
+		}
+		bf.delete(bf.length()-1, bf.length());
+		
+//动态生成值
+//				for (Method mt: c.getMethods()) {				
+//					if (mt.getName().equalsIgnoreCase("get"+string)) {
+//						if (mt.getReturnType()==String.class){
+//							bf.append("'");
+//							bf.append(mt.invoke(t, null).toString());
+//							bf.append("'");
+//						}else
+//							bf.append(mt.invoke(t, null).toString());
+//						bf.append(",");
+//					}
+//				}
+//			}
+		bf.append(")");
+		return bf.toString();
+	} 
+	
+	/**查询语句生成器*/
+	public static String getSelectSql(List<String> columns,String className){
+		StringBuffer sb=new StringBuffer();
+		sb.append("select ");
+		for (String string : columns) {
+			sb.append(string);
+			sb.append(",");
+		}
+		sb.delete(sb.length()-1, sb.length());
+		sb.append(" from ");
+		sb.append(className);
+		sb.append(" ");
+		//此处默认主键是ID,如有特殊情况,请使用注解或配置文件说明
+		sb.append("where id=?");
+		return sb.toString();
+	}
+	
+	/**关闭所有资源(需要的资源请在此统一关闭)*/
+	private static void close() {
+		if (conn!=null) {
+			try {
+				conn.close();
+				conn=null;
+			} catch (SQLException e) {
+				e.printStackTrace();
+			}
+		}
+	}
+
+}
